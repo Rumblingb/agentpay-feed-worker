@@ -1,0 +1,20 @@
+name = "agentpay-feed"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+# Run: wrangler kv:namespace create FEED_KV
+# Paste the returned id and preview_id below
+[[kv_namespaces]]
+binding = "FEED_KV"
+id = "ea27efb1af9d47518006f951dbc46dd4"
+preview_id = "cd5b2991b8074c77b4ef64f290a7b9e2"
+
+[vars]
+EVENT_TTL_SECONDS = "86400"
+# Secrets — set via: wrangler secret put PUBLISH_KEY
+#                     wrangler secret put ADMIN_KEY
+# PUBLISH_KEY  → community trust level (for external publishers)
+# ADMIN_KEY    → agentpay_verified trust level (internal use only)
+
+[env.production]
+vars = { EVENT_TTL_SECONDS = "86400" }
