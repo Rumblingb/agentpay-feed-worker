@@ -75,6 +75,21 @@ export async function readEvents(
   return { events, cursor_ms, has_more };
 }
 
+export async function updateEvent(
+  kv: KVNamespace,
+  eventId: string,
+  patch: Partial<FeedEvent>,
+  ttlSeconds: number,
+): Promise<FeedEvent | null> {
+  const raw = await kv.get(`${EVENT_PREFIX}${eventId}`);
+  if (!raw) return null;
+  const event: FeedEvent = { ...JSON.parse(raw), ...patch };
+  await kv.put(`${EVENT_PREFIX}${eventId}`, JSON.stringify(event), {
+    expirationTtl: ttlSeconds,
+  });
+  return event;
+}
+
 export async function getStats(
   kv: KVNamespace,
 ): Promise<{ total_published: number; ring_size: number; oldest_ms: number | null }> {

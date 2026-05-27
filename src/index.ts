@@ -1,10 +1,12 @@
-import { validatePublishBody, type FeedEvent, type TrustLevel } from './schema';
-import { writeEvent, readEvents, getStats } from './kv';
+import { validatePublishBody, type FeedEvent, type TrustLevel, type EndpointProbe } from './schema';
+import { writeEvent, readEvents, getStats, updateEvent } from './kv';
+import { signEvent, verifyEvent } from './signing';
 
 export interface Env {
   FEED_KV: KVNamespace;
   PUBLISH_KEY: string;
   ADMIN_KEY: string;
+  SIGN_KEY: string;
   EVENT_TTL_SECONDS: string;
 }
 
@@ -81,6 +83,12 @@ export default {
       };
 
       const ttl = parseInt(env.EVENT_TTL_SECONDS ?? '86400', 10);
+
+      // Sign the event if SIGN_KEY is configured
+      if (env.SIGN_KEY?.trim()) {
+        event.signature = await signEvent(event, env.SIGN_KEY.trim());
+      }
+
       await writeEvent(env.FEED_KV, event, ttl);
 
       return json({ ok: true, event_id: event.event_id, timestamp: event.timestamp, trust_level }, 201);
@@ -123,6 +131,104 @@ export default {
       return json({ events, cursor: { since_ms: cursor_ms }, has_more, count: events.length });
     }
 
+    // POST /v1/feed/probe/{event_id} — admin: check if tool endpoint is alive and responding
+    const probeMatch = pathname.match(/^\/v1\/feed\/probe\/(evt_[A-Za-z0-9]+)$/);
+    if (method === 'POST' && probeMatch) {
+      const adminKey = env.ADMIN_KEY?.trim();
+      const auth = request.headers.get('Authorization') ?? '';
+      const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+      if (!adminKey || token !== adminKey) return err('Unauthorized', 401);
+
+      const eventId = probeMatch[1];
+      const raw = await env.FEED_KV.get(`feed:evt:${eventId}`);
+      if (!raw) return err('Event not found', 404);
+      const event: FeedEvent = JSON.parse(raw);
+
+      const endpoint = event.payload?.endpoint as string | undefined;
+      if (!endpoint) return err('Event has no endpoint to probe');
+
+      const started = Date.now();
+      let probe: EndpointProbe;
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'GET',
+          signal: AbortSignal.timeout(10_000),
+          headers: { 'User-Agent': 'AgentPay-Feed-Probe/1.0' },
+        });
+        probe = {
+          probed_at: new Date().toISOString(),
+          endpoint_healthy: resp.status < 500,
+          latency_ms: Date.now() - started,
+          http_status: resp.status,
+        };
+      } catch (e: unknown) {
+        probe = {
+          probed_at: new Date().toISOString(),
+          endpoint_healthy: false,
+          latency_ms: Date.now() - started,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+
+      const ttl = parseInt(env.EVENT_TTL_SECONDS ?? '86400', 10);
+      await updateEvent(env.FEED_KV, eventId, { endpoint_probe: probe }, ttl);
+
+      return json({ ok: true, event_id: eventId, probe });
+    }
+
+    // POST /v1/feed/revoke/{event_id} — admin: mark a tool as withdrawn
+    const revokeMatch = pathname.match(/^\/v1\/feed\/revoke\/(evt_[A-Za-z0-9]+)$/);
+    if (method === 'POST' && revokeMatch) {
+      const adminKey = env.ADMIN_KEY?.trim();
+      const auth = request.headers.get('Authorization') ?? '';
+      const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+      if (!adminKey || token !== adminKey) return err('Unauthorized', 401);
+
+      const eventId = revokeMatch[1];
+      let reason = 'revoked by publisher';
+      try {
+        const body = await request.json() as Record<string, unknown>;
+        if (typeof body?.reason === 'string') reason = body.reason;
+      } catch { /* reason stays default */ }
+
+      const ttl = parseInt(env.EVENT_TTL_SECONDS ?? '86400', 10);
+      const updated = await updateEvent(env.FEED_KV, eventId, {
+        revoked: true,
+        revoke_reason: reason,
+        revoked_at: new Date().toISOString(),
+      }, ttl);
+
+      if (!updated) return err('Event not found', 404);
+      return json({ ok: true, event_id: eventId, revoked: true, reason });
+    }
+
+    // GET /v1/feed/verify/{event_id} — verify event signature and return trust summary
+    const verifyMatch = pathname.match(/^\/v1\/feed\/verify\/(evt_[A-Za-z0-9]+)$/);
+    if (method === 'GET' && verifyMatch) {
+      const eventId = verifyMatch[1];
+      const raw = await env.FEED_KV.get(`feed:evt:${eventId}`);
+      if (!raw) return err('Event not found', 404);
+      const event: FeedEvent = JSON.parse(raw);
+
+      let signature_valid: boolean | null = null;
+      if (event.signature && env.SIGN_KEY?.trim()) {
+        const { signature, ...eventWithoutSig } = event;
+        signature_valid = await verifyEvent(eventWithoutSig as FeedEvent, signature, env.SIGN_KEY.trim());
+      }
+
+      return json({
+        event_id: eventId,
+        trust_level: event.trust_level,
+        source: event.source,
+        category: event.category,
+        published_at: event.timestamp,
+        signature_valid,
+        revoked: event.revoked ?? false,
+        revoke_reason: event.revoke_reason ?? null,
+        endpoint_probe: event.endpoint_probe ?? null,
+      });
+    }
+
     // GET /v1/feed/stats
     if (method === 'GET' && pathname === '/v1/feed/stats') {
       const stats = await getStats(env.FEED_KV);
@@ -145,6 +251,9 @@ export default {
         endpoints: {
           events: `${url.origin}/v1/feed/events`,
           event: `${url.origin}/v1/feed/events/{event_id}`,
+          verify: `${url.origin}/v1/feed/verify/{event_id}`,
+          probe: `${url.origin}/v1/feed/probe/{event_id}`,
+          revoke: `${url.origin}/v1/feed/revoke/{event_id}`,
           publish: `${url.origin}/v1/feed/publish`,
           stats: `${url.origin}/v1/feed/stats`,
         },
@@ -173,13 +282,18 @@ export default {
           recommendation:
             'Run all test_cases in an isolated context. If any fail or produce unexpected side effects, do not grant the tool production access.',
         },
+        trust_signals: {
+          trust_level: 'Set at publish time — agentpay_verified > community > self_reported',
+          signature: 'HMAC-SHA256 over canonical event fields — verify via GET /v1/feed/verify/{id}',
+          endpoint_probe: 'HTTP reachability check run by AgentPay Labs — endpoint_healthy: true means we reached it',
+          revoked: 'revoked: true means the tool has been withdrawn — agents must stop using it',
+          recommendation: 'Only act on events where trust_level=agentpay_verified AND revoked=false. Prefer events where endpoint_probe.endpoint_healthy=true.',
+        },
         auth: {
           read: 'none — all events are public',
+          verify: 'none — GET /v1/feed/verify/{id} is public',
           publish: 'Bearer token — contact Rajiv_baskaran@agentpay.so to obtain a key',
-          trust_levels_by_token: {
-            admin_key: 'agentpay_verified',
-            publish_key: 'community',
-          },
+          probe_revoke: 'admin Bearer token only',
         },
         mcp_compatible: true,
         a2a_compatible: true,

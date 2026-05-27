@@ -50,6 +50,14 @@ export interface FeedEventPayload {
   [key: string]: unknown;
 }
 
+export interface EndpointProbe {
+  probed_at: string;
+  endpoint_healthy: boolean;
+  latency_ms: number;
+  http_status?: number;
+  error?: string;
+}
+
 export interface FeedEvent {
   event_id: string;
   timestamp: string;
@@ -61,6 +69,14 @@ export interface FeedEvent {
   trust_level: TrustLevel;
   payload: FeedEventPayload;
   version: '1';
+  // Cryptographic integrity — verify via GET /v1/feed/verify/{event_id}
+  signature?: string;
+  // Set to true + reason when a tool is withdrawn
+  revoked?: boolean;
+  revoke_reason?: string;
+  revoked_at?: string;
+  // Set after admin probes the endpoint
+  endpoint_probe?: EndpointProbe;
 }
 
 export interface IndexEntry {
